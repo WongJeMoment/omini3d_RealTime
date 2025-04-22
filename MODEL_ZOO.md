@@ -10,6 +10,7 @@ We provide a model zoo for models trained on Omni3D data splits (see paper for m
 | `dla34` |   [omni3d/cubercnn_DLA34_FPN.pth][dla34_omni]  |   [indoor/cubercnn_DLA34_FPN.pth][dla34_in]  |   [outdoor/cubercnn_DLA34_FPN.pth][dla34_out]  |
 
 [dla34_omni]: https://dl.fbaipublicfiles.com/cubercnn/omni3d/cubercnn_DLA34_FPN.pth
+
 [dla34_in]: https://dl.fbaipublicfiles.com/cubercnn/indoor/cubercnn_DLA34_FPN.pth
 [dla34_out]: https://dl.fbaipublicfiles.com/cubercnn/outdoor/cubercnn_DLA34_FPN.pth
 [res34_omni]: https://dl.fbaipublicfiles.com/cubercnn/omni3d/cubercnn_Res34_FPN.pth
