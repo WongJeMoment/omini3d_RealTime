@@ -32,79 +32,119 @@ def do_realtime_detection(args, cfg, model):
     import pyrealsense2 as rs
     import cv2
     import numpy as np
+    import torch
 
     model.eval()
 
-    # 初始化 RealSense 相机
     pipeline = rs.pipeline()
     config = rs.config()
     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-    pipeline.start(config)
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    profile = pipeline.start(config)
 
-    # 加载类别元数据（从 config_file 路径对应的目录下读取 category_meta.json）
+    align = rs.align(rs.stream.color)
+    depth_sensor = profile.get_device().first_depth_sensor()
+    depth_scale = depth_sensor.get_depth_scale()
+
     category_path = os.path.join(util.file_parts(args.config_file)[0], 'category_meta.json')
     if category_path.startswith(util.CubeRCNNHandler.PREFIX):
-         category_path = util.CubeRCNNHandler._get_local_path(util.CubeRCNNHandler, category_path)
+        category_path = util.CubeRCNNHandler._get_local_path(util.CubeRCNNHandler, category_path)
     metadata = util.load_json(category_path)
     cats = metadata['thing_classes']
 
     try:
         while True:
             frames = pipeline.wait_for_frames()
-            color_frame = frames.get_color_frame()
-            if not color_frame:
+            aligned_frames = align.process(frames)
+
+            color_frame = aligned_frames.get_color_frame()
+            depth_frame = aligned_frames.get_depth_frame()
+            if not color_frame or not depth_frame:
                 continue
+
             im = np.asanyarray(color_frame.get_data())
+            depth_raw = np.asanyarray(depth_frame.get_data())
             h, w = im.shape[:2]
+
             focal_length = 4.0 * h / 2 if args.focal_length == 0 else args.focal_length
             px, py = (w / 2, h / 2) if len(args.principal_point) == 0 else args.principal_point
             K = np.array([[focal_length, 0.0, px],
                           [0.0, focal_length, py],
                           [0.0, 0.0, 1.0]])
 
+            depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depth_raw, alpha=0.03), cv2.COLORMAP_JET)
+
             aug_input = T.AugInput(im)
-            _ = T.AugmentationList([T.ResizeShortestEdge(cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MAX_SIZE_TEST, "choice")])(aug_input)
+            _ = T.AugmentationList([
+                T.ResizeShortestEdge(cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MAX_SIZE_TEST, "choice")
+            ])(aug_input)
             image = aug_input.image
+
             batched = [{
                 'image': torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1))).cuda(),
                 'height': h, 'width': w, 'K': K
             }]
 
-            # 进行检测
             dets = model(batched)[0]['instances']
             meshes = []
-            meshes_text = []  # 用于存储每个检测的类别名称、分数和相机坐标
+            meshes_text = []
 
             if len(dets) > 0:
                 for idx, (center_cam, dimensions, pose, score, cat_idx) in enumerate(zip(
                         dets.pred_center_cam, dets.pred_dimensions, dets.pred_pose, dets.scores, dets.pred_classes)):
                     if score < args.threshold:
                         continue
-                    # 获取类别名称
+
                     cat = cats[cat_idx]
-                    # 获取相机坐标：假定 center_cam 为 [x, y, z]
-                    x, y, z = center_cam.tolist()
-                    # 生成显示文本：类别、分数以及 x, y, z 坐标
-                    text = '{} {:.2f} (x:{:.2f}, y:{:.2f}, z:{:.2f})'.format(cat, score, x, y, z)
+                    X, Y, Z = center_cam.tolist()
+                    if Z <= 0:
+                        u, v, z = -1, -1, 0
+                    else:
+                        u = int((X * focal_length / Z) + px)
+                        v = int((Y * focal_length / Z) + py)
+                        if 0 <= u < w and 0 <= v < h:
+                            try:
+                                z = depth_frame.get_distance(u, v)
+                            except Exception:
+                                z = 0
+                        else:
+                            z = 0
+
+                    if z > 0:
+                        x = (u - px) * z / focal_length
+                        y = (v - py) * z / focal_length
+                        center_cam_np = np.array([x, y, z])
+                        depth_str = f"depth:{z:.2f}m"
+                    else:
+                        center_cam_np = center_cam.cpu().numpy()
+                        depth_str = "depth:N/A"
+
+                    text = '{} {:.2f} (x:{:.2f}, y:{:.2f}, z:{:.2f}, {})'.format(
+                        cat, score, center_cam_np[0], center_cam_np[1], center_cam_np[2], depth_str)
                     meshes_text.append(text)
-                    # 生成3D框所需的参数
-                    bbox3D = center_cam.tolist() + dimensions.tolist()
+
+                    bbox3D = center_cam_np.tolist() + dimensions.tolist()
                     color = [c / 255.0 for c in util.get_color(idx)]
                     meshes.append(util.mesh_cuboid(bbox3D, pose.tolist(), color=color))
 
-            # 可视化检测结果（同时显示检测框和文本信息）
+                    if z > 0:
+                        cv2.putText(depth_colormap, f"{z:.2f}m", (u, v),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        cv2.circle(depth_colormap, (u, v), 3, (0, 255, 0), -1)
+
             if len(meshes) > 0:
                 im_drawn_rgb, _, _ = vis.draw_scene_view(im, K, meshes, text=meshes_text, scale=h, blend_weight=0.5)
             else:
                 im_drawn_rgb = im
 
-            cv2.imshow("Real-Time Detection", im_drawn_rgb)
+            concat = np.hstack((im_drawn_rgb, depth_colormap))
+            cv2.imshow("RGB Detection + Depth Distance", concat)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
+
     finally:
         pipeline.stop()
         cv2.destroyAllWindows()
-
 
 def setup(args):
     """
